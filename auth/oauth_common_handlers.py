@@ -432,6 +432,15 @@ async def handle_oauth_register(request: Request):
             headers={"Access-Control-Allow-Origin": "*"}
         )
 
+    # Determine origin once for use throughout this handler
+    origin = str(request.base_url).rstrip('/')
+    try:
+        configured_base = get_oauth_base_url().rstrip('/')
+        if configured_base:
+            origin = configured_base
+    except Exception:
+        pass
+
     try:
         # Parse the registration request
         body = await request.json()
@@ -440,13 +449,6 @@ async def handle_oauth_register(request: Request):
         # Extract redirect URIs from the request or use defaults
         redirect_uris = body.get("redirect_uris", [])
         if not redirect_uris:
-            origin = str(request.base_url).rstrip('/')
-            try:
-                configured_base = get_oauth_base_url().rstrip('/')
-                if configured_base:
-                    origin = configured_base
-            except Exception:
-                pass
             redirect_uris = [f"{origin}/oauth2callback", "http://localhost:5173/auth/callback"]
 
         # Build the registration response with our pre-configured credentials

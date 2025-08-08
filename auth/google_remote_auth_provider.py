@@ -110,6 +110,8 @@ class GoogleRemoteAuthProvider(RemoteAuthProvider):
         routes.append(Route("/oauth2/register", handle_oauth_register, methods=["POST", "OPTIONS"]))
         
         routes.append(Route("/.well-known/oauth-authorization-server", handle_oauth_authorization_server, methods=["GET", "OPTIONS"]))
+        # Compatibility route some clients try (e.g., appending resource path)
+        routes.append(Route("/.well-known/oauth-authorization-server/mcp", handle_oauth_authorization_server, methods=["GET", "OPTIONS"]))
         
         routes.append(Route("/.well-known/oauth-client", handle_oauth_client_config, methods=["GET", "OPTIONS"]))
         
