@@ -20,6 +20,7 @@ from urllib.parse import urlparse
 from auth.scopes import SCOPES
 from auth.oauth_responses import create_error_response, create_success_response, create_server_error_response
 from auth.google_auth import handle_auth_callback, check_client_secrets
+from auth.oauth_relay_state import is_relay_state, consume_relay_state, register_code_for_relay
 from core.config import get_oauth_redirect_uri
 
 logger = logging.getLogger(__name__)
@@ -73,6 +74,29 @@ class MinimalOAuthServer:
 
                 # Exchange code for credentials
                 redirect_uri = get_oauth_redirect_uri()
+                # If this is a relay state, do not exchange here; redirect the browser to the client's listener
+                if is_relay_state(state):
+                    relay = consume_relay_state(state)
+                    if relay:
+                        client_redirect_uri, client_state = relay
+                        # Build redirect to the client's local listener with code and original state
+                        from urllib.parse import urlencode
+                        query = {
+                            "code": code,
+                        }
+                        if client_state:
+                            query["state"] = client_state
+                        redirect_url = f"{client_redirect_uri}?{urlencode(query)}"
+                        logger.info(f"Relaying OAuth code to client listener at {client_redirect_uri}")
+                        # Mark this code as relayed so token proxy can normalize redirect_uri
+                        try:
+                            if code:
+                                register_code_for_relay(code)
+                        except Exception:
+                            pass
+                        from starlette.responses import RedirectResponse
+                        return RedirectResponse(url=redirect_url, status_code=302)
+
                 verified_user_id, credentials = handle_auth_callback(
                     scopes=SCOPES,
                     authorization_response=str(request.url),

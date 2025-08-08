@@ -20,6 +20,7 @@ from typing import Optional, List
 
 from starlette.routing import Route
 from pydantic import AnyHttpUrl
+from core.config import get_oauth_base_url
 
 try:
     from fastmcp.server.auth import RemoteAuthProvider
@@ -76,12 +77,14 @@ class GoogleRemoteAuthProvider(RemoteAuthProvider):
             algorithm="RS256"
         )
         
-        # Initialize RemoteAuthProvider with local server as the authorization server
-        # This ensures OAuth discovery points to our proxy endpoints instead of Google directly
+        # Initialize RemoteAuthProvider with external origin as the authorization server
+        # and the MCP endpoint as the protected resource. This matches clients expecting
+        # the protected resource to be the MCP route (e.g., /mcp) on the same origin.
+        origin = get_oauth_base_url().rstrip('/')
         super().__init__(
             token_verifier=token_verifier,
-            authorization_servers=[AnyHttpUrl(f"{self.base_url}:{self.port}")],
-            resource_server_url=f"{self.base_url}:{self.port}"
+            authorization_servers=[AnyHttpUrl(origin)],
+            resource_server_url=f"{origin}/mcp"
         )
         
         logger.debug("GoogleRemoteAuthProvider initialized")
@@ -107,6 +110,8 @@ class GoogleRemoteAuthProvider(RemoteAuthProvider):
         routes.append(Route("/oauth2/register", handle_oauth_register, methods=["POST", "OPTIONS"]))
         
         routes.append(Route("/.well-known/oauth-authorization-server", handle_oauth_authorization_server, methods=["GET", "OPTIONS"]))
+        # Compatibility route some clients try (e.g., appending resource path)
+        routes.append(Route("/.well-known/oauth-authorization-server/mcp", handle_oauth_authorization_server, methods=["GET", "OPTIONS"]))
         
         routes.append(Route("/.well-known/oauth-client", handle_oauth_client_config, methods=["GET", "OPTIONS"]))
         

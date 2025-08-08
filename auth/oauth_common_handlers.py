@@ -16,6 +16,8 @@ from google.oauth2.credentials import Credentials
 from auth.oauth21_session_store import store_token_session
 from auth.google_auth import save_credentials_to_file
 from auth.scopes import get_current_scopes
+from auth.oauth_relay_state import create_relay_state, is_relay_state, is_code_relay
+from core.config import get_oauth_redirect_uri
 from core.config import WORKSPACE_MCP_BASE_URI, WORKSPACE_MCP_PORT, get_oauth_base_url
 
 logger = logging.getLogger(__name__)
@@ -51,6 +53,26 @@ async def handle_oauth_authorize(request: Request):
     all_scopes = set(client_scopes) | set(enabled_tool_scopes)
     params["scope"] = " ".join(sorted(all_scopes))
     logger.info(f"OAuth 2.1 authorization: Requesting scopes: {params['scope']}")
+
+    # Force redirect_uri to our server's callback to satisfy Google's registered URIs
+    server_redirect_uri = get_oauth_redirect_uri()
+
+    # If client provided a loopback redirect_uri and/or state, wrap them in a relay state
+    client_redirect_uri = params.get("redirect_uri")
+    client_state = params.get("state")
+    if client_redirect_uri:
+        try:
+            relay_state = create_relay_state(client_redirect_uri, client_state)
+            params["state"] = relay_state
+            params["redirect_uri"] = server_redirect_uri
+            logger.debug(f"Using relay state for client redirect {client_redirect_uri}")
+        except Exception as e:
+            logger.warning(f"Could not create relay state for redirect_uri {client_redirect_uri}: {e}")
+            # Fall back to server redirect without relay
+            params["redirect_uri"] = server_redirect_uri
+    else:
+        # Ensure redirect_uri is set to our server callback
+        params["redirect_uri"] = server_redirect_uri
 
     # Build Google authorization URL
     google_auth_url = "https://accounts.google.com/o/oauth2/v2/auth?" + urlencode(params)
@@ -99,6 +121,21 @@ async def handle_proxy_token_exchange(request: Request):
                     form_data['client_secret'] = [client_secret]
                     logger.debug("Added missing client_secret to token request")
             
+            # If redirect_uri points to client's loopback listener but state indicates relay,
+            # normalize redirect_uri to our server callback so Google accepts it.
+            try:
+                # Normalize based on relay state or known relayed code
+                redirect_uri_vals = form_data.get('redirect_uri', [])
+                state_vals = form_data.get('state', [])
+                code_vals = form_data.get('code', [])
+                state_val = state_vals[0] if state_vals else None
+                code_val = code_vals[0] if code_vals else None
+                if redirect_uri_vals and (is_relay_state(state_val) or is_code_relay(code_val)):
+                    form_data['redirect_uri'] = [get_oauth_redirect_uri()]
+                    logger.debug("Normalized redirect_uri to server callback for relay token exchange")
+            except Exception as e:
+                logger.debug(f"Could not normalize redirect_uri for relay token exchange: {e}")
+
             # Reconstruct body with added credentials
             body = urlencode(form_data, doseq=True).encode('utf-8')
 
@@ -217,17 +254,23 @@ async def handle_oauth_protected_resource(request: Request):
             }
         )
 
-    base_url = get_oauth_base_url()
+    # Prefer configured base URL; fall back to request origin
+    origin = str(request.base_url).rstrip('/')
+    try:
+        configured_base = get_oauth_base_url().rstrip('/')
+        if configured_base:
+            origin = configured_base
+    except Exception:
+        pass
+    resource_url = f"{origin}/mcp"
     metadata = {
-        "resource": base_url,
-        "authorization_servers": [
-            base_url
-        ],
+        "resource": resource_url,
+        "authorization_servers": [origin],
         "bearer_methods_supported": ["header"],
         "scopes_supported": get_current_scopes(),
         "resource_documentation": "https://developers.google.com/workspace",
         "client_registration_required": True,
-        "client_configuration_endpoint": f"{base_url}/.well-known/oauth-client",
+        "client_configuration_endpoint": f"{origin}/.well-known/oauth-client",
     }
 
     return JSONResponse(
@@ -251,8 +294,14 @@ async def handle_oauth_authorization_server(request: Request):
             }
         )
 
-    # Get base URL once and reuse
-    base_url = get_oauth_base_url()
+    # Prefer configured base URL; fall back to request origin
+    origin = str(request.base_url).rstrip('/')
+    try:
+        configured_base = get_oauth_base_url().rstrip('/')
+        if configured_base:
+            origin = configured_base
+    except Exception:
+        pass
 
     try:
         # Fetch metadata from Google
@@ -267,10 +316,10 @@ async def handle_oauth_authorization_server(request: Request):
                     metadata.setdefault("pkce_required", True)
 
                     # Override endpoints to use our proxies
-                    metadata["token_endpoint"] = f"{base_url}/oauth2/token"
-                    metadata["authorization_endpoint"] = f"{base_url}/oauth2/authorize"
+                    metadata["token_endpoint"] = f"{origin}/oauth2/token"
+                    metadata["authorization_endpoint"] = f"{origin}/oauth2/authorize"
                     metadata["enable_dynamic_registration"] = True
-                    metadata["registration_endpoint"] = f"{base_url}/oauth2/register"
+                    metadata["registration_endpoint"] = f"{origin}/oauth2/register"
                     return JSONResponse(
                         content=metadata,
                         headers={
@@ -283,8 +332,8 @@ async def handle_oauth_authorization_server(request: Request):
         return JSONResponse(
             content={
                 "issuer": "https://accounts.google.com",
-                "authorization_endpoint": f"{base_url}/oauth2/authorize",
-                "token_endpoint": f"{base_url}/oauth2/token",
+                "authorization_endpoint": f"{origin}/oauth2/authorize",
+                "token_endpoint": f"{origin}/oauth2/token",
                 "userinfo_endpoint": "https://www.googleapis.com/oauth2/v2/userinfo",
                 "revocation_endpoint": "https://oauth2.googleapis.com/revoke",
                 "jwks_uri": "https://www.googleapis.com/oauth2/v3/certs",
@@ -330,13 +379,22 @@ async def handle_oauth_client_config(request: Request):
             headers={"Access-Control-Allow-Origin": "*"}
         )
 
+    origin = str(request.base_url).rstrip('/')
+    # Prefer explicit base URL if provided via env for reverse proxy correctness
+    try:
+        configured_base = get_oauth_base_url().rstrip('/')
+        if configured_base:
+            origin = configured_base
+    except Exception:
+        pass
+
     return JSONResponse(
         content={
             "client_id": client_id,
             "client_name": "Google Workspace MCP Server",
-            "client_uri": f"{WORKSPACE_MCP_BASE_URI}:{WORKSPACE_MCP_PORT}",
+            "client_uri": f"{origin}",
             "redirect_uris": [
-                f"{WORKSPACE_MCP_BASE_URI}:{WORKSPACE_MCP_PORT}/oauth2callback",
+                f"{origin}/oauth2callback",
                 "http://localhost:5173/auth/callback"
             ],
             "grant_types": ["authorization_code", "refresh_token"],
@@ -374,6 +432,15 @@ async def handle_oauth_register(request: Request):
             headers={"Access-Control-Allow-Origin": "*"}
         )
 
+    # Determine origin once for use throughout this handler
+    origin = str(request.base_url).rstrip('/')
+    try:
+        configured_base = get_oauth_base_url().rstrip('/')
+        if configured_base:
+            origin = configured_base
+    except Exception:
+        pass
+
     try:
         # Parse the registration request
         body = await request.json()
@@ -382,17 +449,14 @@ async def handle_oauth_register(request: Request):
         # Extract redirect URIs from the request or use defaults
         redirect_uris = body.get("redirect_uris", [])
         if not redirect_uris:
-            redirect_uris = [
-                f"{WORKSPACE_MCP_BASE_URI}:{WORKSPACE_MCP_PORT}/oauth2callback",
-                "http://localhost:5173/auth/callback"
-            ]
+            redirect_uris = [f"{origin}/oauth2callback", "http://localhost:5173/auth/callback"]
 
         # Build the registration response with our pre-configured credentials
         response_data = {
             "client_id": client_id,
             "client_secret": client_secret,
             "client_name": body.get("client_name", "Google Workspace MCP Server"),
-            "client_uri": body.get("client_uri", f"{WORKSPACE_MCP_BASE_URI}:{WORKSPACE_MCP_PORT}"),
+            "client_uri": body.get("client_uri", origin),
             "redirect_uris": redirect_uris,
             "grant_types": body.get("grant_types", ["authorization_code", "refresh_token"]),
             "response_types": body.get("response_types", ["code"]),
@@ -402,7 +466,7 @@ async def handle_oauth_register(request: Request):
             # Additional OAuth 2.1 fields
             "client_id_issued_at": int(time.time()),
             "registration_access_token": "not-required",  # We don't implement client management
-            "registration_client_uri": f"{get_oauth_base_url()}/oauth2/register/{client_id}"
+            "registration_client_uri": f"{origin}/oauth2/register/{client_id}"
         }
 
         logger.info("Dynamic client registration successful - returning pre-configured Google credentials")
