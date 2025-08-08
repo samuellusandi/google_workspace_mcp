@@ -15,6 +15,7 @@ from auth.oauth21_session_store import get_oauth21_session_store, set_auth_provi
 from auth.google_auth import handle_auth_callback, start_auth_flow, check_client_secrets
 from auth.mcp_session_middleware import MCPSessionMiddleware
 from auth.oauth_responses import create_error_response, create_success_response, create_server_error_response
+from auth.oauth_relay_state import is_relay_state, consume_relay_state, register_code_for_relay
 from auth.auth_info_middleware import AuthInfoMiddleware
 from auth.fastmcp_google_auth import GoogleWorkspaceAuthProvider
 from auth.scopes import SCOPES
@@ -149,6 +150,25 @@ async def oauth2_callback(request: Request) -> HTMLResponse:
         return create_error_response(msg)
 
     try:
+        # If this is a relay state, forward the code to the client's local listener
+        if is_relay_state(state):
+            relay = consume_relay_state(state)
+            if relay:
+                client_redirect_uri, client_state = relay
+                from urllib.parse import urlencode
+                query = {"code": code}
+                if client_state:
+                    query["state"] = client_state
+                redirect_url = f"{client_redirect_uri}?{urlencode(query)}"
+                try:
+                    if code:
+                        register_code_for_relay(code)
+                except Exception:
+                    pass
+                from starlette.responses import RedirectResponse
+                logger.info(f"Relaying OAuth code to client listener at {client_redirect_uri}")
+                return RedirectResponse(url=redirect_url, status_code=302)
+
         error_message = check_client_secrets()
         if error_message:
             return create_server_error_response(error_message)
